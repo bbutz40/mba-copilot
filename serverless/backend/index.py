@@ -5,15 +5,18 @@ A RAG-powered document Q&A system for MBA students.
 
 from __future__ import annotations
 
+import csv
 import io
 import os
 import random
+import re
 import string
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import fitz  # PyMuPDF
+import tiktoken
 from docx import Document
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -59,11 +62,15 @@ class Config:
     PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
     PINECONE_INDEX = os.environ.get("PINECONE_INDEX", "mba-copilot")
 
-    # RAG Settings
-    CHUNK_SIZE = 1000
-    CHUNK_OVERLAP = 200
-    TOP_K = 8
-    MIN_SCORE = 0.3
+    # RAG Settings (token-based)
+    # Larger chunks to keep more context together
+    CHUNK_TOKENS_DOCS = 800
+    CHUNK_OVERLAP_TOKENS_DOCS = 150
+
+    # Retrieval settings
+    RETRIEVAL_TOP_K = 20  # Retrieve more candidates
+    CONTEXT_MAX_CHUNKS = 8  # Pass more context to LLM
+    MIN_SCORE = 0.25  # Lower threshold to be more inclusive
 
 
 config = Config()
@@ -106,6 +113,66 @@ def get_pinecone_index() -> Index:
         _pinecone_index = pc.Index(config.PINECONE_INDEX)
 
     return _pinecone_index
+
+
+# =============================================================================
+# Token Utilities
+# =============================================================================
+
+
+def num_tokens(text: str, model: str | None = None) -> int:
+    """Count tokens in text using tiktoken."""
+    encoding_model = model or config.EMBEDDING_MODEL
+    try:
+        enc = tiktoken.encoding_for_model(encoding_model)
+    except KeyError:
+        # Fallback to cl100k_base for unknown models
+        enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(text))
+
+
+def chunk_by_tokens(
+    text: str,
+    chunk_tokens: int,
+    overlap_tokens: int,
+    model: str | None = None,
+) -> list[str]:
+    """Split text into chunks by token count (not characters)."""
+    text = text.replace("\r\n", "\n").strip()
+    if not text:
+        return []
+
+    if overlap_tokens >= chunk_tokens:
+        raise ValueError("overlap_tokens must be < chunk_tokens")
+
+    encoding_model = model or config.EMBEDDING_MODEL
+    try:
+        enc = tiktoken.encoding_for_model(encoding_model)
+    except KeyError:
+        enc = tiktoken.get_encoding("cl100k_base")
+
+    tokens = enc.encode(text)
+
+    # If text fits in one chunk, return as-is
+    if len(tokens) <= chunk_tokens:
+        return [text]
+
+    chunks: list[str] = []
+    start = 0
+
+    while start < len(tokens):
+        end = min(start + chunk_tokens, len(tokens))
+        chunk_text = enc.decode(tokens[start:end]).strip()
+        if chunk_text:
+            chunks.append(chunk_text)
+
+        if end >= len(tokens):
+            break
+
+        # Move start forward, accounting for overlap
+        start = max(0, end - overlap_tokens)
+
+    return chunks
 
 
 # =============================================================================
@@ -206,8 +273,70 @@ def _extract_pptx_text(content: bytes) -> str:
     return "\n\n".join(s for s in slides_out if s).strip()
 
 
-def extract_text(file: UploadFile) -> str:
-    """Extract text from uploaded file (PDF/DOCX/PPTX/TXT/MD/CSV)."""
+def _extract_csv_structured(content: bytes) -> list[dict[str, Any]]:
+    """Extract CSV as row-based chunks with column headers.
+
+    Each row becomes a chunk formatted as: "ColA: valA | ColB: valB | ..."
+    """
+    text = content.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+
+    rows: list[dict[str, Any]] = []
+    for idx, row in enumerate(reader, start=1):
+        # Format: "ColA: valA | ColB: valB"
+        chunk_text = " | ".join(f"{k}: {v}" for k, v in row.items() if v and v.strip())
+        if chunk_text.strip():
+            rows.append({
+                "row_number": idx,
+                "text": chunk_text,
+            })
+
+    return rows
+
+
+def _extract_pdf_with_pages(content: bytes) -> list[dict[str, Any]]:
+    """Extract PDF with page-level metadata.
+
+    Returns list of dicts with: page_number, text
+    """
+    doc = fitz.open(stream=content, filetype="pdf")
+    try:
+        pages: list[dict[str, Any]] = []
+        y_tol = 3.0  # points
+
+        for page_num, page in enumerate(doc, start=1):
+            blocks: Any = page.get_text("blocks")
+            clean_blocks: list[Any] = []
+
+            for b in blocks:
+                if (
+                    isinstance(b, (tuple, list))
+                    and len(b) >= 5
+                    and isinstance(b[4], str)
+                    and b[4].strip()
+                ):
+                    clean_blocks.append(b)
+
+            clean_blocks.sort(key=lambda b: (round(float(b[1]) / y_tol), float(b[0])))
+
+            page_text = "\n".join(str(b[4]).rstrip() for b in clean_blocks).strip()
+            if page_text:
+                pages.append({
+                    "page_number": page_num,
+                    "text": page_text,
+                })
+
+        return pages
+    finally:
+        doc.close()
+
+
+def extract_structured_chunks(file: UploadFile) -> list[dict[str, Any]]:
+    """Extract file into structured chunks with metadata.
+
+    Simple token-based chunking for all file types.
+    Returns list of dicts with 'text' and 'chunk_index'.
+    """
     content = file.file.read()
     try:
         file.file.seek(0)
@@ -219,59 +348,32 @@ def extract_text(file: UploadFile) -> str:
 
     filename = file.filename.lower()
 
-    if filename.endswith(".pdf"):
-        return _extract_pdf_text_best_fidelity(content)
-
-    if filename.endswith(".docx"):
-        return _extract_docx_text(content)
-
+    # Extract text based on file type
     if filename.endswith(".pptx"):
-        return _extract_pptx_text(content)
+        text = _extract_pptx_text(content)
+    elif filename.endswith(".csv"):
+        # For CSV, just treat as plain text for now
+        text = content.decode("utf-8-sig", errors="replace")
+    elif filename.endswith(".pdf"):
+        text = _extract_pdf_text_best_fidelity(content)
+    elif filename.endswith(".docx"):
+        text = _extract_docx_text(content)
+    elif filename.endswith((".txt", ".md")):
+        text = content.decode("utf-8-sig", errors="replace")
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename}")
 
-    if filename.endswith((".txt", ".md", ".csv")):
-        return content.decode("utf-8-sig", errors="replace")
-
-    raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename}")
-
-
-def chunk_text(text: str) -> list[str]:
-    """Split text into overlapping chunks."""
-    text = text.replace("\r\n", "\n").strip()
-    if not text:
+    if not text.strip():
         return []
 
-    if config.CHUNK_OVERLAP >= config.CHUNK_SIZE:
-        raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE")
+    # Chunk everything with token-based chunking
+    text_chunks = chunk_by_tokens(
+        text,
+        chunk_tokens=config.CHUNK_TOKENS_DOCS,
+        overlap_tokens=config.CHUNK_OVERLAP_TOKENS_DOCS,
+    )
 
-    if len(text) <= config.CHUNK_SIZE:
-        return [text]
-
-    chunks: list[str] = []
-    start = 0
-
-    while start < len(text):
-        end = min(start + config.CHUNK_SIZE, len(text))
-
-        # Try to break at paragraph or sentence boundary
-        if end < len(text):
-            para_break = text.rfind("\n\n", start + config.CHUNK_SIZE // 2, end)
-            if para_break > 0:
-                end = para_break
-            else:
-                sent_break = text.rfind(". ", start + config.CHUNK_SIZE // 2, end)
-                if sent_break > 0:
-                    end = sent_break + 1
-
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        if end >= len(text):
-            break
-
-        start = max(0, end - config.CHUNK_OVERLAP)
-
-    return chunks
+    return [{"text": chunk, "chunk_index": i} for i, chunk in enumerate(text_chunks)]
 
 
 def generate_document_id() -> str:
@@ -457,10 +559,15 @@ def generate_answer(
 
 
 class ChatSettings(BaseModel):
-    """Settings for chat completion and RAG retrieval."""
+    """Settings for chat completion and RAG retrieval.
+
+    Note: top_k is now just for backwards compatibility.
+    The system retrieves config.RETRIEVAL_TOP_K candidates and passes
+    the best config.CONTEXT_MAX_CHUNKS to the LLM.
+    """
 
     chat_model: str = "gpt-4o-mini"
-    top_k: int = 8
+    top_k: int = 15  # Kept for backwards compatibility
     min_score: float = 0.3
     system_prompt: str = "You are a helpful AI assistant."
 
@@ -494,24 +601,26 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
         query_embedding = generate_embedding(request.message)
 
+        # Retrieve more candidates than we'll use
         similar = query_similar(
             query_embedding,
-            top_k=settings.top_k,
+            top_k=config.RETRIEVAL_TOP_K,
             document_ids=request.document_ids,
         )
 
         # Filter by minimum score
         relevant = [c for c in similar if float(c.get("score", 0.0)) >= settings.min_score]
 
-        # If we have results, build context. Otherwise return all similar chunks with lower threshold
+        # If we have results, limit to best N for context
         if relevant:
-            context_chunks = relevant
+            context_chunks = relevant[: config.CONTEXT_MAX_CHUNKS]
         elif similar:
             # Fallback: if min_score filtered everything, use top results anyway
-            context_chunks = similar[: max(3, settings.top_k // 2)]
+            context_chunks = similar[: max(3, config.CONTEXT_MAX_CHUNKS // 2)]
         else:
             context_chunks = []
 
+        # Build context
         if context_chunks:
             context = "\n\n---\n\n".join(
                 [f"[Source: {c['filename']}]\n{c['text']}" for c in context_chunks]
@@ -534,6 +643,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
                 "score": c["score"],
                 "filename": c["filename"],
                 "document_id": c["document_id"],
+                "metadata": c.get("metadata", {}),
             }
             for c in context_chunks
         ]
@@ -561,36 +671,36 @@ async def upload(
         # Use provided filename (with folder structure) or fall back to file.filename
         display_filename = filename or file.filename or "unknown"
 
-        text = extract_text(file)
-        if not text.strip():
-            raise HTTPException(status_code=400, detail="Could not extract text from file")
-
-        text_chunks = chunk_text(text)
-        if not text_chunks:
+        # Extract structured chunks with metadata
+        structured_chunks = extract_structured_chunks(file)
+        if not structured_chunks:
             raise HTTPException(status_code=400, detail="No content to process")
 
-        embeddings = generate_embeddings_batch(text_chunks)
+        # Extract text for embeddings
+        chunk_texts = [chunk["text"] for chunk in structured_chunks]
+        embeddings = generate_embeddings_batch(chunk_texts)
 
         document_id = generate_document_id()
         uploaded_at = datetime.now(timezone.utc).isoformat()
 
+        # Build final chunks with embeddings and metadata
         chunks: list[dict[str, Any]] = []
-        for i, (text_chunk, embedding) in enumerate(zip(text_chunks, embeddings, strict=False)):
-            chunks.append(
-                {
-                    "id": f"{document_id}_chunk_{i}",
-                    "embedding": embedding,
-                    "metadata": {
-                        "text": text_chunk,
-                        "document_id": document_id,
-                        "filename": display_filename,
-                        "chunk_index": i,
-                        "total_chunks": len(text_chunks),
-                        "uploaded_at": uploaded_at,
-                        "is_first_chunk": i == 0,
-                    },
-                }
-            )
+        for i, (structured_chunk, embedding) in enumerate(
+            zip(structured_chunks, embeddings, strict=False)
+        ):
+            chunks.append({
+                "id": f"{document_id}_chunk_{i}",
+                "embedding": embedding,
+                "metadata": {
+                    "text": structured_chunk["text"],
+                    "document_id": document_id,
+                    "filename": display_filename,
+                    "chunk_index": i,
+                    "total_chunks": len(structured_chunks),
+                    "uploaded_at": uploaded_at,
+                    "is_first_chunk": i == 0,
+                },
+            })
 
         store_chunks(chunks)
 
@@ -598,7 +708,7 @@ async def upload(
             "success": True,
             "document_id": document_id,
             "filename": display_filename,
-            "chunks": len(text_chunks),
+            "chunks": len(structured_chunks),
         }
 
     except HTTPException:
