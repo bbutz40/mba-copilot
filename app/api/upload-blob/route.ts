@@ -40,9 +40,14 @@ export async function POST(request: NextRequest) {
         // Process the file from blob storage
         try {
           const { originalFilename } = JSON.parse(tokenPayload || '{}');
-          const backendUrl = process.env.BACKEND_URL || 'http://localhost:8000';
+
+          // In production, use the Vercel deployment URL; in dev, use localhost
+          const backendUrl = process.env.VERCEL_URL
+            ? `https://${process.env.VERCEL_URL}`
+            : 'http://localhost:3000';
 
           console.log('[Blob] Processing file:', originalFilename);
+          console.log('[Blob] Backend URL:', backendUrl);
 
           const response = await fetch(`${backendUrl}/backend/upload-from-url`, {
             method: 'POST',
