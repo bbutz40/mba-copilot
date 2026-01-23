@@ -15,10 +15,5 @@
       "src": "/backend/(.*)",
       "dest": "/serverless/backend/index.py"
     }
-  ],
-  "functions": {
-    "serverless/backend/index.py": {
-      "maxDuration": 300
-    }
-  }
+  ]
 }
