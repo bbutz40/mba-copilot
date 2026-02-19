@@ -2,6 +2,7 @@
 name = "mba-copilot"
 version = "1.0.0"
 description = "Personal AI copilot for MBA students - RAG-powered document Q&A"
+authors = [{ name = "Malek Ben Sliman", email = "malekbensliman@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -14,41 +15,25 @@ dependencies = [
     "python-docx>=1.1.0,<2.0.0",
     "python-dotenv>=1.0.0,<2.0.0",
     "python-pptx>=1.0.2,<2.0.0",
-    "tiktoken>=0.12.0,<1.0.0"
+    "tiktoken>=0.12.0,<1.0.0",
 ]
 
-[tool.poetry]
-name = "mba-copilot"
-version = "1.0.0"
-description = "Personal AI copilot for MBA students - RAG-powered document Q&A"
-authors = ["Malek Ben Sliman <malekbensliman@gmail.com>"]
-readme = "README.md"
-packages = [{ include = "serverless" }]
-
-[tool.poetry.dependencies]
-python = "^3.12"
-fastapi = "^0.109.0"
-uvicorn = { extras = ["standard"], version = "^0.27.0" }
-openai = "^1.12.0"
-pinecone-client = "^3.0.0"
-python-multipart = "^0.0.6"
-PyMuPDF = "^1.23.0"
-python-docx = "^1.1.0"
-python-dotenv = "^1.0.0"
-python-pptx = "^1.0.2"
-tiktoken = "^0.12.0"
-
-[tool.poetry.group.dev.dependencies]
-ruff = "^0.5.3"
-mypy = "^1.8.0"
+[dependency-groups]
+dev = [
+    "ruff>=0.5.3",
+    "mypy>=1.8.0",
+]
 
 [tool.pyright]
 # VSCode uses pyright instead of mypy out of the box and this disables it
 typeCheckingMode = "off"
 
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["serverless"]
 
 [tool.ruff]
 target-version = "py312"
